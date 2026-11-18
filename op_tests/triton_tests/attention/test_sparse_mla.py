@@ -19,7 +19,11 @@ from aiter.ops.triton.attention.sparse_mla import (
 )
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
-from op_tests.triton_tests.attention.test_pa_decode_sparse import _inv_rope_ref
+from op_tests.triton_tests.attention.test_pa_decode_sparse import (
+    _compiled_variants,
+    _inv_rope_ref,
+    _unaligned,
+)
 
 # The arch-native fp8, as a producer on this machine writes it. That is OCP e4m3,
 # what the kernel reads, only on FP8_ARCHS; the fp8 cases skip everywhere else,
@@ -462,11 +466,15 @@ def test_sparse_mla_fp8_kernel(H, C, topk, ragged, pool, opts):
 @pytest.mark.parametrize("one_alloc", [True, False], ids=["one_alloc", "two_allocs"])
 @pytest.mark.parametrize("mxfp8", [False, True])
 @pytest.mark.parametrize("splits", [1, 3])
-def test_sparse_mla_fp8_two_caches(one_alloc, mxfp8, splits):
+def test_sparse_mla_fp8_two_caches(monkeypatch, one_alloc, mxfp8, splits):
     """DSv4's SWA + top-k caches with the fused inverse-RoPE (and MXFP8) output on
     the fp8 kernel: one allocation under one scale (one loop) or two with their own
-    scales (two loops)."""
+    scales (two loops). Unaligned positions and odd cache rows must reuse the
+    compiled kernels."""
     _skip_unless_supported("fp8", "tensor")
+    variants = _compiled_variants(
+        monkeypatch, smd._sparse_mla_fp8, smd._sparse_mla_reduce_gfx950
+    )
     C, H, B, nb = 8, 64, 64, 512
     sm = KV_LORA**-0.5
     torch.manual_seed(0)
@@ -483,36 +491,60 @@ def test_sparse_mla_fp8_two_caches(one_alloc, mxfp8, splits):
     m_idx, m_ptr = make_indices(C, nb * B, 128, "cuda", 1, ragged=False)
     x_idx, x_ptr = make_indices(C, nb * B, 256, "cuda", 2, ragged=False)
     idx = torch.cat([m_idx.view(C, -1), x_idx.view(C, -1) + nb * B], 1).flatten()
-    sink = torch.randn(H, device="cuda")
+    sink = torch.randn(H, dtype=torch.float32, device="cuda")
     truth = truth.reshape(-1, KV_LORA).to(torch.bfloat16)
     ref = reference(q, truth, idx, m_ptr + x_ptr, sm, sink)
-    ang = torch.rand(4096, 32, device="cuda") * 6.2831853
+    ang = torch.rand(4096, 32, dtype=torch.float32, device="cuda") * 6.2831853
     cos_sin = torch.cat([ang.cos(), ang.sin()], dim=1)
     pos = torch.randint(0, 4096, (C,), device="cuda")
     ref = _inv_rope_ref(ref, pos, cos_sin)
     data = torch.empty(C, H * KV_LORA, dtype=torch.float8_e4m3fn, device="cuda")
     scale = torch.empty(C, H * KV_LORA // 32, dtype=torch.uint8, device="cuda")
+    kw = {
+        "kv_scale": ks,
+        "qk_rope_head_dim": 0,
+        "dot_precision": "fp8",
+        "attn_sink": sink,
+        "kv_splits": splits,
+        "extra_indptr": x_ptr,
+        "extra_indices": x_idx,
+        "extra_kv_scale": x_ks,
+        "inv_rope_cos_sin_cache": cos_sin,
+        "out_mxfp8": (data, scale) if mxfp8 else None,
+    }
     out, _ = sparse_mla_fwd(
-        q,
-        main,
-        m_ptr,
-        m_idx,
-        sm,
-        kv_scale=ks,
-        qk_rope_head_dim=0,
-        dot_precision="fp8",
-        attn_sink=sink,
-        kv_splits=splits,
-        extra_kv=extra,
-        extra_indptr=x_ptr,
-        extra_indices=x_idx,
-        extra_kv_scale=x_ks,
-        inv_rope_positions=pos,
-        inv_rope_cos_sin_cache=cos_sin,
-        out_mxfp8=(data, scale) if mxfp8 else None,
+        q, main, m_ptr, m_idx, sm, extra_kv=extra, inv_rope_positions=pos, **kw
     )
     if mxfp8:
         step = torch.exp2(scale.float() - 127.0).view(C, -1, 1)
         out = (data.float().view(C, -1, 32) * step).view(C, H, KV_LORA)
     e = rel_err(out, ref)
     assert e < 0.1, f"{one_alloc=} {mxfp8=} {splits=}: rel-err {e:.3e}"
+    if mxfp8:
+        return
+    # Positions sliced at an odd int64 offset, and in one allocation either cache
+    # at an odd row, reuse the kernels compiled for aligned ones.
+    runs = [(main, extra, _unaligned(pos))]
+    if one_alloc:
+        # A flat pool's page stride differs from the interleaved one's: one variant.
+        flat = torch.empty(
+            2 * nb * B + 1, main.shape[-1], dtype=main.dtype, device="cuda"
+        )
+        lo, hi = flat[: nb * B], flat[nb * B :]
+        runs += [
+            (lo, hi[:-1], pos),
+            (lo, hi[1:], _unaligned(pos)),
+            (hi[1:], lo, _unaligned(pos)),
+        ]
+    for m, x, p in runs:
+        m, x = m.view(nb, B, -1), x.view(nb, B, -1)
+        m.copy_(main)
+        x.copy_(extra)
+        again, _ = sparse_mla_fwd(
+            q, m, m_ptr, m_idx, sm, extra_kv=x, inv_rope_positions=p, **kw
+        )
+        assert torch.equal(again, out), f"{one_alloc=} {splits=}"
+    assert variants() == {
+        "_sparse_mla_fp8": 2 if one_alloc else 1,
+        "_sparse_mla_reduce": int(splits > 1),
+    }

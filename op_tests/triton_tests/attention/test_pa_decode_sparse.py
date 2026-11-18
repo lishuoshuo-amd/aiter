@@ -3,10 +3,14 @@
 
 # from __future__ import annotations
 
+from collections import defaultdict
+
 import pytest
 import torch
 import triton
+from triton.runtime import driver
 
+import aiter.ops.triton.attention.pa_decode_sparse as pds
 from aiter.ops.triton.attention.pa_decode_sparse import pa_decode_sparse
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.test_common import checkAllclose
@@ -998,17 +1002,38 @@ def _inv_rope_ref(x, pos, cos_sin):
     return x
 
 
+def _unaligned(t):
+    """A copy of int64 t starting 8 bytes past a 16-byte boundary, like a slice."""
+    out = torch.empty(t.numel() + 1, dtype=t.dtype, device=t.device)[1:]
+    assert out.data_ptr() % 16 == 8
+    return out.copy_(t)
+
+
+def _compiled_variants(monkeypatch, *kernels):
+    """Count each kernel's compiled variants from this call on."""
+    device = driver.active.get_current_device()
+    caches = {}
+    for k in kernels:
+        monkeypatch.setattr(k, "device_caches", defaultdict(k.create_binder))
+        caches[k.fn.__name__] = k.device_caches[device][0]
+    return lambda: {name: len(cache) for name, cache in caches.items()}
+
+
 # T=4: split-K, the reduce writes the output. T=256: one 32-head program per row
 # writes it.
 @pytest.mark.parametrize("T, H", [(4, 16), (256, 32)])
 @pytest.mark.parametrize("mxfp8", [False, True])
-def test_pa_decode_sparse_inv_rope_mxfp8_epilogue(T, H, mxfp8):
+def test_pa_decode_sparse_inv_rope_mxfp8_epilogue(monkeypatch, T, H, mxfp8):
     """The fused output epilogue (inverse RoPE, optionally MXFP8) on the SWA +
-    top-k two-loop, against the reference rotated back; MXFP8 is dequantized."""
+    top-k two-loop, against the reference rotated back; MXFP8 is dequantized.
+    Unaligned positions must reuse the compiled kernels."""
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
     if arch_info.get_arch() != "gfx950":
         pytest.skip("the output epilogue is a gfx950 gluon path")
+    variants = _compiled_variants(
+        monkeypatch, pds._sparse_mla_gfx950, pds._sparse_mla_reduce_gfx950
+    )
 
     device = "cuda"
     D, main_len, extra_len = 512, 128, 256
@@ -1065,6 +1090,10 @@ def test_pa_decode_sparse_inv_rope_mxfp8_epilogue(T, H, mxfp8):
     else:
         out = pa_decode_sparse(*args, **kw)
         torch.testing.assert_close(out.float(), ref, atol=1e-2, rtol=1e-2)
+        # Positions sliced at an odd int64 offset reuse the kernels compiled above.
+        kw["inv_rope_positions"] = _unaligned(pos)
+        assert torch.equal(pa_decode_sparse(*args, **kw), out)
+        assert variants() == {"_sparse_mla": 1, "_sparse_mla_reduce": int(T == 4)}
 
 
 # ---------------------------------------------------------------------------
